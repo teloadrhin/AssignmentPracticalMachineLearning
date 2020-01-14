@@ -1,0 +1,159 @@
+---
+title: "Assignment for the Practical Machine Learning course on Coursera"
+author: "teloadrhin"
+date: "10/01/2020"
+bibliography: bibliography.bib  
+csl: physical-review-d.csl
+output: bookdown::html_document2
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(dplyr)
+```
+
+
+# Synopsis  
+The goal of this assignment is to predict the manner in which certain physical exercises were conducted based on data gathered by wearable sensors. A machine learning model is trained on the labelled training data. Section 2 describes how to obtain and prepare the training and test data. The definition of the model and the training are part of Section 3. In Section 4 the accuracy of the trained model is assessed. Finally, in Section 5 the trained model is used to make predictions about the test data. References are collected at the end of this report. 
+
+# Getting and cleaning the data 
+The training and test data come from the publication @velloso2013a and are available online. 
+
+```{r getData, dependson="setup"}
+### Get Data 
+trainFile <- "pml-training.csv"
+trainUrl <-  "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+
+testFile <- "pml-testing.csv"
+testUrl <-  "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+
+if (! file.exists(testFile)){
+    print("Downloading test data ..." )
+    download.file(testUrl,testFile,method="curl")
+    print("... done!")
+}
+
+if (! file.exists(trainFile)){
+    print("Downloading training data ..." )
+    download.file(trainUrl,trainFile,method="curl")
+    print("... done!")
+}
+
+testing <- read.csv("pml-testing.csv")
+training <- read.csv("pml-training.csv") 
+```
+
+Unfortunately there is no complete code book available for the data sets. Since the goal is to predict how an exercise was performed by using sensor information, the time stamps will not be taken into account in the analysis. This still leaves a large number of potential predictors. To narrow down the number of predictors used for model training, we apply a naive PCA and select the components that account for more than 90% of the variance in the data. Factor like predictors are removed for the PCA and later added to the final training data set. 
+
+```{r cleanData, dependson="getData"}
+na_count <- sapply(training, function(y) sum(is.na(y)))
+empty_count <- sapply(training[,na_count < 1], function(y) sum(y==""))
+
+# Removing mostly emptcolumns and "X", which is simply an index.
+sortOut <- c(names(na_count[na_count > 0]),names(empty_count[empty_count > 0]),"X")
+
+training.clean <- training %>% select(-sortOut) %>% select(-contains("timestamp"))
+
+# Remove factor variables for PCA
+preP <- training.clean %>% select(-c("user_name","new_window","classe"))
+# PCA 
+pca <- prcomp(preP,scale.=TRUE,center = TRUE)
+
+# Find components accounting for >90% of variance 
+var.pca <- pca$sdev^2 
+idx = sum(cumsum(var.pca/sum(var.pca)) < .9)
+
+# Get training data from PCA
+pcaData <- data.frame(predict(pca, preP))
+pcaData <- pcaData[,1:idx]
+
+# Reintroduce factor variables to training data 
+train.data <- data.frame(c(training.clean[,c("user_name","new_window","classe")],pcaData))  
+```
+
+# Training a random forest model 
+Random forests are often used for classification problems. In the following we train a simple random forest model. Parallelisation is used to speed up the training, as described in this [course related community page](https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md). The model parameter is tuned using 10-fold cross validation. The cross validation is repeated 3 times with the folds split in a different way every time. 
+
+No class labels are included in the test data. It is therefore not possible to check the accuracy of the trained model on the test data. As a crosscheck for the out of sample error estimates we only train our model on 80% of the training data and keep the rest for validation.
+
+The default values for the method "rf" are _mtry_=floor(sqrt(ncol(train.data)-1))=4 and _ntrees_=500. The _train_ function from the _caret_ package only tunes the parameter _mtry_. The parameter _ntrees_ is set to 150 to speed up the training. If the achieved accuracy is not good enough, _ntrees_ can be increased for the next run. For the tuning of _mtry_ a few values around the default _mtry_=4 are taken into consideration.
+
+```{r trainModel, dependson="cleanData", cache=TRUE,warning=FALSE,message=FALSE}
+# Set up parallel calculations 
+library(parallel)
+library(doParallel)
+library(tictoc)
+mlCluster <- makeCluster(detectCores() - 1,outfile = "")
+registerDoParallel(mlCluster)
+
+# Split training data 
+set.seed(1256)
+trainIDX <- createDataPartition(train.data$classe,p=.8,list=FALSE)
+
+train.data.train <- train.data[trainIDX,]
+train.data.tst  <- train.data[-trainIDX,] 
+
+rfGrid <- data.frame(mtry= seq(2,5,1))
+
+
+# Set up training parameters 
+tic("Training")
+trainParams <- trainControl(method="repeatedcv", number=10, repeats = 3, allowParallel = TRUE,verboseIter=FALSE)
+
+mdl1 <- train(classe ~ ., train.data.train,trControl=trainParams,method="rf",tuneGrid=rfGrid,ntree=150)
+
+stopCluster(mlCluster)
+toc()
+print(mdl1)
+```
+
+# Evaluating training results 
+The cross validation error estimates are shown in Figure \@ref(fig:evalResFig). 
+```{r evalResFig, dependson="trainModel",fig.align="center",fig.width=8,  fig.height=4 ,fig.cap="The plot shows the cross validation estimates for the out of sample error for different values of the model parameter 'mtry'.",echo = FALSE, results = TRUE}
+plot(mdl1, main="Out of sample error estimates",xlab="Number of Randomly Selected Predictors (mtry)")
+```
+The estimated accuracy of the trained model with the optimal value _mtry_ = 3 is better than 97%. In the following we calculate the accuracy on the data we held back for validation. 
+
+``` {r evalRes, dependson="trainModel"}
+# Predic class for validation data
+valPred <- predict(mdl1,train.data.tst)
+valCM <- confusionMatrix(train.data.tst$classe,valPred)
+
+print(valCM$overall)
+```
+The accuracy of around 98% of the model predictions on the validation data is comparable to the accuracy estimates from the cross validation. This gives us some confidence that the model does not have a problem with overfitting. 
+
+
+Finally, let us check how the accuracy depends on the number of trees in the random forest model. In Figure \@ref(fig:evalResFig2) the error rate and accuracy of the model is plotted as a function of the number of trees.   
+```{r evalResFig2, dependson="trainModel",fig.align="center",fig.width=8,  fig.height=4 ,fig.cap="Error rate (left) and accuracy (right) for the trained model as a function of the number of trees.",echo = FALSE, results = TRUE}
+err.rate <- data.frame(mdl1$finalModel$err.rate)
+
+par(mfrow=c(1,2))
+
+plot(err.rate$OOB,ylab="error rate",xlab="Number of trees", main="Error Rate",pch=19,col="orange")
+plot(1-err.rate$OOB,ylab="accuracy",xlab="Number of trees", main="Accuracy",pch=19,col="steelblue")
+
+```
+The curves become very flat after around _ntrees_=120 and it seems that further increasing _ntrees_ will not significantly improve the accuracy of the model. 
+
+
+# Predicting 
+Once the model is trained, predicting the class variable "classe" for the test data is straightforward. After preparing the test data using the PCA one can use the _predict_ function of the caret package.     
+
+```{r predict, dependson="trainModel",warning=FALSE}
+# Get testing data from PCA
+pcaTest <- data.frame(predict(pca, testing))
+pcaTest <- pcaTest[,1:idx]
+pcaTest <- data.frame(c(testing[,c("user_name","new_window")],pcaTest))  
+
+cPredict <- predict(mdl1,pcaTest)
+print(cPredict)
+```
+As it turns out when this result is submitted to the prediction quiz on the course homepage, the accuracy of this prediction is 100%. 
+
+
+
+# References
